@@ -14,7 +14,8 @@
 #define CLOCK_PIN 12
 #define HALL_PIN 4
 
-#define POLAR_ROWS 60 // 360 degrees / 6 degree resolution
+#define POLAR_ROWS 60  // 360 degrees / 6 degree resolution
+#define MAX_FRAMES 850 // Max frames we can buffer (~10MB / 12KB per frame)
 
 // ---------------------------------------------------------
 // GLOBALS
@@ -23,7 +24,10 @@ CRGB leds[NUM_LEDS];
 WebServer server(80);
 
 // Image data buffer (RGB565 format)
-uint16_t fanBuffer[POLAR_ROWS][NUM_LEDS];
+// For single images: 1 frame. For videos: multiple frames.
+uint16_t (*frameBuffers)[POLAR_ROWS][NUM_LEDS] = NULL;
+uint32_t frameCount = 0;
+uint32_t currentFrame = 0;
 bool imageLoaded = false;
 
 // Rotation tracking (set by ISR, read by loop)
@@ -37,21 +41,75 @@ volatile bool newRotation = false;
 void loadBuffers() {
   Serial.println("Loading bin file from FFat...");
 
+  // Free previous buffers
+  if (frameBuffers != NULL) {
+    free(frameBuffers);
+    frameBuffers = NULL;
+    frameCount = 0;
+    currentFrame = 0;
+    imageLoaded = false;
+  }
+
   String filename = (FAN_ID == 1) ? "/fan1.bin" : "/fan2.bin";
 
-  if (FFat.exists(filename)) {
-    File f = FFat.open(filename, FILE_READ);
-    if (f) {
-      for (int i = 0; i < POLAR_ROWS; i++) {
-        f.read((uint8_t *)fanBuffer[i], NUM_LEDS * 2);
-      }
-      f.close();
-      Serial.println(filename + " loaded successfully!");
-      imageLoaded = true;
-    }
-  } else {
+  if (!FFat.exists(filename)) {
     Serial.println("No bin file found yet. Upload one via the app!");
-    imageLoaded = false;
+    return;
+  }
+
+  File f = FFat.open(filename, FILE_READ);
+  if (!f) {
+    Serial.println("Failed to open bin file!");
+    return;
+  }
+
+  // Read 4-byte header: frame count (little-endian uint32)
+  uint32_t numFrames = 0;
+  f.read((uint8_t *)&numFrames, 4);
+
+  if (numFrames == 0 || numFrames > MAX_FRAMES) {
+    Serial.printf("Invalid frame count: %u\n", numFrames);
+    f.close();
+    return;
+  }
+
+  Serial.printf("File contains %u frame(s)\n", numFrames);
+
+  // Allocate memory for all frames using PSRAM
+  size_t bufferSize = numFrames * POLAR_ROWS * NUM_LEDS * sizeof(uint16_t);
+  Serial.printf("Allocating %u bytes for frame buffers...\n", bufferSize);
+
+  frameBuffers =
+      (uint16_t(*)[POLAR_ROWS][NUM_LEDS])ps_malloc(bufferSize);
+
+  if (frameBuffers == NULL) {
+    // Fall back to regular malloc if PSRAM not available
+    frameBuffers =
+        (uint16_t(*)[POLAR_ROWS][NUM_LEDS])malloc(bufferSize);
+  }
+
+  if (frameBuffers == NULL) {
+    Serial.println("ERROR: Failed to allocate memory for frames!");
+    f.close();
+    return;
+  }
+
+  // Read all frames
+  for (uint32_t frame = 0; frame < numFrames; frame++) {
+    for (int row = 0; row < POLAR_ROWS; row++) {
+      f.read((uint8_t *)frameBuffers[frame][row], NUM_LEDS * 2);
+    }
+  }
+
+  f.close();
+  frameCount = numFrames;
+  currentFrame = 0;
+  imageLoaded = true;
+
+  Serial.printf("Loaded %u frame(s) successfully!\n", frameCount);
+  if (frameCount > 1) {
+    Serial.printf("Video mode: %u frames will animate on rotation\n",
+                  frameCount);
   }
 }
 
@@ -136,9 +194,10 @@ void handleNotFound() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== Hologram Fan Firmware ===");
+  Serial.println("\n\n=== Hologram Fan Firmware (Video Support) ===");
   Serial.print("Fan ID: ");
   Serial.println(FAN_ID);
+  Serial.printf("Free PSRAM: %u bytes\n", ESP.getFreePsram());
 
   // Initialize LEDs
   FastLED.addLeds<APA102, DATA_PIN, CLOCK_PIN, BGR, DATA_RATE_MHZ(12)>(
@@ -198,11 +257,10 @@ void loop() {
       unsigned long timePerRow = rotationUs / POLAR_ROWS;
       unsigned long rotationStart = hallTriggerTime;
 
-      // Render all rows for this rotation
+      // Render all rows for this rotation using the current frame
       for (int row = 0; row < POLAR_ROWS; row++) {
-        // Fill LED buffer for this row
         for (int i = 0; i < NUM_LEDS; i++) {
-          leds[i] = rgb565_to_crgb(fanBuffer[row][i]);
+          leds[i] = rgb565_to_crgb(frameBuffers[currentFrame][row][i]);
         }
         FastLED.show();
 
@@ -211,6 +269,11 @@ void loop() {
         while (micros() < targetTime) {
           // Tight spin-wait for precise timing
         }
+      }
+
+      // Advance to next frame (for video playback)
+      if (frameCount > 1) {
+        currentFrame = (currentFrame + 1) % frameCount;
       }
     }
   }
